@@ -1,6 +1,7 @@
 """Struct representing a node (operation) in a computational graph"""
 
 using DiffRules
+using Statistics
 
 @DiffRules.define_diffrule Base.identity(x) = :(1.0)
 
@@ -26,9 +27,16 @@ end
 _INITIALIZER_SYMBOLS = [:randn, :zeros, :ones]
 _INITIALIZERS = Dict(init => eval(:( (args...) -> $(init)(args...))) for init in _INITIALIZER_SYMBOLS )
 
+_BATCHCOMBINE_SYMBOLS = [:mean]
+_BATCHCOMBINERS = Dict( how => eval(:( arr -> reshape($(how)(arr, dims=1), size(arr)[2:end])   )) for how in _BATCHCOMBINE_SYMBOLS)
+
 function getinitializer(name::Symbol)
     name in keys((_INITIALIZERS)) || throw(ArgumentError("Invalid intializer $name"))
     return _INITIALIZERS[name]
+end
+
+function getcombiner(how::Symbol)
+    return _BATCHCOMBINERS[how]
 end
 
 "A variable which holds trainable weights and gradients"
@@ -60,6 +68,10 @@ function set!(var::Variable{T, N}, data::Array{T, N}) where {T, N}
     var.data .= data
 end
 
+function setgrad!(var::Variable{T, N}, grad::Array{T, N}) where {T,N}
+    var.grad .= grad
+end
+
 """Check if array is compatible with given node dim"""
 function checkvalidnodedim(input::Array, dim::Int)
     return ndims(input) <= 2 && size(input)[end] == dim
@@ -88,7 +100,7 @@ mutable struct RootNode{T<:Real} <: CompNode{T}
 
 end
 
-# RootNode(dim, input) = RootNode{_DEFAULT_FLOAT}(dim, input)
+
 RootNode{T}(dim::Int) where T = RootNode{T}(dim, nothing)
 RootNode{T}(input::Array{T}) where T = RootNode{T}(size(input)[end], input) 
 RootNode(input::Array) = RootNode{eltype(input)}(input)
@@ -194,7 +206,7 @@ function apply!(node::CompNode{T}, input::Array{T}) where {T<:Real}
     return actfn.(s)
 end
 
-"""Compute the node's forward pass: output tensor from its input node, cache input and jacobian, and
+"""Compute the node's forward pass recursively: output tensor from its input node, cache input and jacobian, and
 return output."""
 function forward!(node::Node{T}) where T <: Real
     input = output!(node.input)
@@ -204,6 +216,43 @@ end
 function output!(node::Node{T}) where T <: Real
     return forward!(node)
 end
+
+" Compute local gradients for a batch of upstream gradients."
+function getlocalbatchgrads(node::Node{T}, upgrads::Array{T}) where T <: Real
+    if ndims(node._cachedinput) == 1
+        batchsize=1
+    else
+        batchsize = size(node._cachedinput)[1]
+    end
+    x = reshape(node._cachedinput, (batchsize, 1, node.inpdim))
+    j = reshape(node._cachedvectorjac, (batchsize, node.dim) )
+
+    #gradient WRT node bias
+    biasgrad = upgrads .* j
+    #gradient WRT node weights
+    wtgrad = reshape(biasgrad, (batchsize, node.dim, 1)) .* x
+    #gradient WRT inputs
+    inpgrad = biasgrad * node.weights.data
+    return biasgrad, wtgrad, inpgrad
+end
+
+    
+"""Performs a node's backward pass, given upstream gradients vector `upgrads`
+    (typically gradients of loss function WRT node output).
+        Updates grad tensors of node weights and bias
+        Returns vector of gradients WRT node inputs.
+        `combine`: how to combine gradient signals from different batches when updating the weight grads. Default: :mean """
+
+function backward!(node::Node{T}, upgrads::Array{T}; combine=:mean) where T <: Real
+    biasgrad, wtgrad, inpgrad = getlocalbatchgrads(node, upgrads)
+    batchcombiner = getcombiner(combine)
+    biasgrad, wtgrad = batchcombiner(biasgrad), batchcombiner(wtgrad)
+    setgrad!(node.bias, biasgrad)
+    setgrad!(node.weights, wtgrad)
+    return inpgrad
+end
+    
+
 
 """ Holds a computational graph """
 mutable struct Graph{T}
@@ -225,13 +274,11 @@ function addlayer!(graph::Graph{T}) where T <: Real
     push!(graph.nodes, Array{CompNode{T}, 1}() )
 end
 
-
 "Add a node at the specified level in the topological sort.
     `level`: topological-sort level at which to add the node. >= 0 (0 means input layer)"
 function addnode!(graph::Graph{T}, node::CompNode{T}, level::Int) where T <: Real
     (level < 0 || level > numlayers(graph)) && throw(ArgumentError("$level is not valid for graph with $(numlayers(graph)) layers."))
     level == 0 && (isa(node, RootNode{T}) || throw(ArgumentError("Only root nodes can be added to level 0")))
-
     node._layerindex != 0 && throw(ArgumentError("This node has already been added to a graph!"))
     if level == 0
         nodelist = graph.rootnodes
@@ -242,7 +289,6 @@ function addnode!(graph::Graph{T}, node::CompNode{T}, level::Int) where T <: Rea
     setlayerindex!(node, layerindex)
     push!(nodelist, node)
 end
-
 
 function addnode!(graph::Graph{T}, node::CompNode{T}) where T <: Real
     toplevel = numlayers(graph)
@@ -276,7 +322,6 @@ function forward!(graph::Graph{T}) where T<: Real
             push!(cur_outputs, output)
         end
         prev_outputs = cur_outputs
-        
     end
     return cur_outputs
 end

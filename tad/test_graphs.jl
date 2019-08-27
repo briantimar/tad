@@ -82,6 +82,25 @@ end
     n2 = Node(5, n1)
     y2 = forward!(n2)
     @test size(y2) == (10, 5)
+
+    #test node backward pass
+    r1 = RootNode(ones(5, 2))
+    n1 = Node(3, r1, activation=:sin, init=:ones)
+    y = forward!(n1)
+    upgrads = ones(5, 3)
+    biasgrad, wtgrad, inpgrad = getlocalbatchgrads(n1, upgrads)
+    @test size(biasgrad) == (5, 3)
+    @test size(wtgrad) == (5, 3, 2)
+    @test size(inpgrad) == (5, 2)
+
+    @test isapprox(biasgrad, cos.(ones(5, 3) * 3))
+    @test isapprox(wtgrad, ones(5, 3, 2) * cos(3))
+    @test isapprox(inpgrad, ones(5, 2) * 3 * cos(3))
+
+    inpgrad = backward!(n1, upgrads)
+    @test isapprox(inpgrad, ones(5, 2) * 3 * cos(3))
+    @test isapprox(n1.weights.grad, ones(3, 2) * cos(3))
+    @test isapprox(n1.bias.grad, ones(3) * cos(3))
 end
 
 @testset "Graph" begin
@@ -171,4 +190,9 @@ end
     init = getinitializer(:ones)
     x = init(Float32, 4)
     @test isapprox(sum(x), 4)
+
+    #test batch combination
+    c = getcombiner(:mean)
+    a = ones(3, 4)
+    @test isapprox(c(a), ones(4))
 end
