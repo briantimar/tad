@@ -74,7 +74,22 @@ end
     node3 = Node{Float32}(2, node2, activation=:cos)
     @test node3.level == 2
 
+    #check ancestors
+    anc = getancestors(node3)
+    @test length(anc) == 1
+    @test anc[1] === node2
+
 end
+
+@testset "Reduce nodes" begin
+    r1 = RootNode(ones(5, 1))
+    n1 = Node(2, r1, init=:ones)
+    s = SumNode(n1)
+    @test s.level == 2
+    out = apply!(s, ones(5, 2))
+    @test isapprox(out, ones(5) * 2)
+end
+
 
 @testset "Node passes" begin
     r1 = RootNode(rand(10, 3))
@@ -131,6 +146,12 @@ end
     n4 = Node{Float32}(2, n3)
     n5 = Node{Float32}(2, n4)
     @test_throws ArgumentError addnode!(g, n5)
+
+    #test batchsize
+    rn1 = RootNode(randn(Float32, 10, 4))
+    g = Graph{Float32}()
+    addnode!(g, rn1)
+    @test batchsize(g) == 10
 end
 
 @testset "Graph forward pass" begin
@@ -152,6 +173,25 @@ end
     #check that output is as expected
     @test isapprox(outputs[1], tanh.(ones(1)*3))
 end
+
+@testset "Graph backward pass" begin
+    g = Graph{Float32}()
+    rn = RootNode(ones(Float32, 5, 2)*2)
+    n1 = Node(2, rn, init=:ones)
+    n2 = Node(1, n1, init=:ones, activation=:sin)
+    out = SumNode(n2)
+    for node in (rn, n1, n2, out)
+        addnode!(g, node)
+    end
+    outputs=forward!(g)
+    backward!(g)
+    @test isapprox(n2.bias.grad, ones(1) * cos(11))
+    @test isapprox(n2.weights.grad, ones(1, 2) * 5 * cos(11))
+    @test isapprox(n1.bias.grad, ones(2) * cos(11))
+    @test isapprox(n1.weights.grad, ones(2, 2) * cos(11) * 2)
+    
+end
+
 
 @testset "miscellaneous" begin
     x = ones(3)

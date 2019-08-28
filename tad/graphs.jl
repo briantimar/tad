@@ -11,6 +11,7 @@ _DEFAULT_FLOAT = Float32
 abstract type GraphElement end
 abstract type AbstractNode <: GraphElement end
 abstract type CompNode{T<:Real} <: AbstractNode end
+abstract type ReduceNode{T<:Real} <: CompNode{T} end
 
 # populate a table with some activation functions...
 _ACTIVATION_SYMBOLS = [(:Base, :identity), (:Base, :cos), (:Base, :sin), (:Base, :tanh)]
@@ -226,7 +227,6 @@ function getlocalbatchgrads(node::Node{T}, upgrads::Array{T}) where T <: Real
     end
     x = reshape(node._cachedinput, (batchsize, 1, node.inpdim))
     j = reshape(node._cachedvectorjac, (batchsize, node.dim) )
-
     #gradient WRT node bias
     biasgrad = upgrads .* j
     #gradient WRT node weights
@@ -242,7 +242,6 @@ end
         Updates grad tensors of node weights and bias
         Returns vector of gradients WRT node inputs.
         `combine`: how to combine gradient signals from different batches when updating the weight grads. Default: :mean """
-
 function backward!(node::Node{T}, upgrads::Array{T}; combine=:mean) where T <: Real
     biasgrad, wtgrad, inpgrad = getlocalbatchgrads(node, upgrads)
     batchcombiner = getcombiner(combine)
@@ -253,15 +252,44 @@ function backward!(node::Node{T}, upgrads::Array{T}; combine=:mean) where T <: R
 end
     
 
+"Sums a batched vector to produce a batched scalar"
+mutable struct SumNode{T} <: ReduceNode{T}
+    input::CompNode{T}
+    inpdim::Int
+    level::Int
+    _layerindex::Int
+
+    function SumNode{T}(input::CompNode{T}) where T <: Real
+        inpdim = input.dim
+        level = input.level + 1
+        _layerindex = 0
+        return new(input, inpdim, level, _layerindex)
+    end
+    
+end
+
+SumNode(input::CompNode{T}) where T <: Real = SumNode{T}(input)
+
+function apply!(node::SumNode{T}, input::Array{T}) where T <: Real
+    sumaxis = ndims(input)
+    return dropdims(sum(input, dims=sumaxis), dims=sumaxis)
+end
+
+function backward!(node::SumNode{T}) where T <: Real
+    return ones(T, node.inpdim)
+end
 
 """ Holds a computational graph """
 mutable struct Graph{T}
     rootnodes::Array{RootNode{T}, 1}
     nodes::Array{Array{CompNode{T}, 1},1}
+    _has_completed_forward::Bool
+
     function Graph{T}() where T <: Real
         rootnodes = Array{RootNode{T},1}()
         nodes = Array{Array{CompNode{T}}, 1}()
-        return new(rootnodes, nodes)
+        _has_completed_forward = false
+        return new(rootnodes, nodes, _has_completed_forward)
     end
 end
 
@@ -307,6 +335,25 @@ function numoutputs(graph::Graph)
     return length(graph.nodes[end])
 end
 
+function getoutput(graph::Graph)
+    numoutputs(graph) != 1 && throw(ArgumentError("Graph does not have a unique output node."))
+    return graph.nodes[end][1]
+end
+
+""" List of ancestors of the given node."""
+function getancestors(node::CompNode)
+    return [node.input]
+end
+
+function batchsize(graph::Graph)
+    rn = graph.rootnodes[1]
+    isnothing(rn.input) && throw(ArgumentError("Graph inputs not initialized"))
+    if ndims(rn.input) == 1
+        return 1
+    end
+    return size(rn.input)[1]
+end
+
 "Performs a forward pass of the graph. Starting from the lowest graph level and moving upwards, 
 node outputs are computed, and inputs and jacobians are cached."
 function forward!(graph::Graph{T}) where T<: Real
@@ -323,5 +370,38 @@ function forward!(graph::Graph{T}) where T<: Real
         end
         prev_outputs = cur_outputs
     end
+    graph._has_completed_forward = true
     return cur_outputs
 end
+
+" Performs backward pass on the graph. "
+function backward!(graph::Graph{T}; combine=:mean) where T <: Real
+    output = getoutput(graph)
+    isa(output, SumNode) || throw(ErrorException("Expecting ReduceNode for output"))
+    graph._has_completed_forward || throw(ErrorException("Need to run forward pass before backward"))
+    
+    bs = batchsize(graph)
+    #accumulated gradients into each node
+    cachedgrads = Dict( (i,j) => zeros(T, bs, graph.nodes[i][j].dim) for i in 1:numlayers(graph)-1 for j in 1:length(graph.nodes[i]))
+
+    for i in numlayers(graph):-1:1
+        curlayer = graph.nodes[i]
+        
+        for j in 1:length(curlayer)
+            node = curlayer[j]
+            if i == numlayers(graph)
+                upgrads = backward!(node)
+                upgrads = reshape(upgrads, (1, length(upgrads)))
+            else    
+                upgrads = backward!(node, cachedgrads[(i,j)], combine=combine)
+            end
+            if i > 1
+                for ancestor in getancestors(node)
+                    cg = cachedgrads[(ancestor.level, ancestor._layerindex)]
+                    cg .= cg .+ upgrads
+                end
+            end
+        end
+    end
+end    
+
