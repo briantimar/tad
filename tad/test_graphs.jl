@@ -189,7 +189,19 @@ end
     @test isapprox(n2.weights.grad, ones(1, 2) * 5 * cos(11))
     @test isapprox(n1.bias.grad, ones(2) * cos(11))
     @test isapprox(n1.weights.grad, ones(2, 2) * cos(11) * 2)
-    
+
+    g = Graph{Float32}()
+    rn = RootNode(ones(Float32, 1,1) * 2)
+    n1 = Node(1, rn, init=:ones)
+    n1.weights.data .= n1.weights.data .* 2
+    out = SumNode(n1)
+    for node in (rn, n1, out)
+        addnode!(g, node)
+    end
+    y = forward!(g)
+    backward!(g)
+    @test isapprox(rn.grad, ones(1) * 2 )
+
 end
 
 

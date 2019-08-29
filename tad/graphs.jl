@@ -91,12 +91,18 @@ mutable struct RootNode{T<:Real} <: CompNode{T}
     input::Union{Array{T}, Nothing}
     level::Int
     _layerindex::Int
+    grad::Union{Array{T}, Nothing}
 
     function RootNode{T}(dim::Int, input::Union{Array{T}, Nothing}) where T <: Real 
         isnothing(input)  || (! checkvalidnodedim(input, dim) && throw(ArgumentError("Input has invalid shape $(size(input)) for node dim $dim")) );
         level = 0
         _layerindex = 0
-        return new(dim, input, level, _layerindex)
+        if isnothing(input)
+            grad = nothing
+        else
+            grad = zeros(T, size(input))
+        end
+        return new(dim, input, level, _layerindex, grad)
     end
 
 end
@@ -112,6 +118,7 @@ gettype(::NT) where NT <: CompNode{T} where T <: Real = T
 "Set the input of a root node."
 function setinput!(node::RootNode{T}, input::Array{T}) where T <: Real
     node.input = input
+    node.grad = zeros(T, size(input))
 end
 
 "Get the output of a node"
@@ -383,6 +390,9 @@ function backward!(graph::Graph{T}; combine=:mean) where T <: Real
     bs = batchsize(graph)
     #accumulated gradients into each node
     cachedgrads = Dict( (i,j) => zeros(T, bs, graph.nodes[i][j].dim) for i in 1:numlayers(graph)-1 for j in 1:length(graph.nodes[i]))
+    for j in 1:length(graph.rootnodes)
+        cachedgrads[(0,j)] = zeros(T, bs, graph.rootnodes[j].dim)
+    end
 
     for i in numlayers(graph):-1:1
         curlayer = graph.nodes[i]
@@ -395,13 +405,17 @@ function backward!(graph::Graph{T}; combine=:mean) where T <: Real
             else    
                 upgrads = backward!(node, cachedgrads[(i,j)], combine=combine)
             end
-            if i > 1
-                for ancestor in getancestors(node)
-                    cg = cachedgrads[(ancestor.level, ancestor._layerindex)]
-                    cg .= cg .+ upgrads
-                end
+            
+            for ancestor in getancestors(node)
+                cg = cachedgrads[(ancestor.level, ancestor._layerindex)]
+                cg .= cg .+ upgrads
             end
+            
         end
+    end
+    #finally, let grads flow into root nodes
+    for j in 1:length(graph.rootnodes)
+        graph.rootnodes[j].grad = cachedgrads[(0, j)]
     end
 end    
 
